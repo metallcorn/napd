@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""napctl — read napd state from the session bus and print it.
+Stand-in for a future Plasma applet: it just consumes Status()."""
+
+import sys
+import json
+
+import dbus
+
+BUS_NAME = "ai.palabra.NapD"
+OBJ_PATH = "/ai/palabra/NapD"
+IFACE = "ai.palabra.NapD"
+
+CAP_EMOJI = {"cam": "🎥", "mic": "🎤"}
+
+
+def fmt_w(w):
+    return "—" if w is None else f"{w:.1f} W"
+
+
+def fmt_pct(p):
+    return "" if p is None else f"{p:.0f}%"
+
+
+def management(r):
+    """One consistent label for what napd is doing to an app (+ capture)."""
+    caps = r["capture"]
+    capm = "".join(CAP_EMOJI.get(t, t) for t in caps.split("+")) if caps else ""
+    if r["focused"]:
+        return f"FOCUS {capm}".strip()
+    st = r["status"]
+    if st == "throttled":
+        return "CAPPED"
+    if st == "would-throttle":
+        return "would cap"
+    if caps:                       # a backgrounded call is always protected
+        return f"PROTECTED · {caps} {capm}".strip()
+    if st == "watching":
+        why = r["reason"].split("(")[-1].rstrip(")") if "(" in r["reason"] else "protected"
+        return f"PROTECTED · {why}"
+    return "idle"
+
+
+def main():
+    try:
+        bus = dbus.SessionBus()
+        data = json.loads(bus.get_object(BUS_NAME, OBJ_PATH).Status(dbus_interface=IFACE))
+    except dbus.DBusException:
+        print("napd is not running.  start it with:  systemctl --user start napd")
+        sys.exit(1)
+
+    meta = data["meta"]
+    apps = data["apps"]
+    src = (meta.get("source") or "?").upper()
+    prof = meta.get("power_profile") or "?"
+    cal = meta.get("calibrated")
+    WIDTH = 68
+
+    mode = meta["mode"].upper()
+    if meta["mode"] == "enforce" and src == "AC":
+        mode = "ENFORCE (paused on AC)"
+    print(f"power: {src} · {prof} · {mode} · focus: {meta.get('focused') or '—'}")
+    print("─" * WIDTH)
+
+    # ---- POWER ---------------------------------------------------------
+    def pline(label, w, pct=None, tail=""):
+        ws = "n/a (AC)" if (w is None and "total" in label) else fmt_w(w)
+        print(f"  {label:<21}{ws:>9}{fmt_pct(pct):>7}   {tail}".rstrip())
+
+    print(f"POWER  (~W {'calibrated' if cal else 'rough est'} · {meta.get('ncpu','?')} cores)")
+    pline("total (real)", meta.get("total_watts"), meta.get("sys_core_pct"))
+    if meta.get("amdgpu_watts") is not None:
+        pline("SoC/GPU (amdgpu)", meta.get("amdgpu_watts"))
+    if cal:
+        pline("├ addressable", meta.get("cpu_dynamic_watts"), meta.get("sys_core_pct"),
+              "← throttling can reduce")
+        pline("│   apps", meta.get("addressable_watts"), meta.get("manageable_core_pct"))
+        pline("│   system/kernel", meta.get("sys_kernel_watts"), meta.get("unmanageable_core_pct"))
+        pline("└ fixed baseline", meta.get("fixed_baseline_w"), None, "screen/GPU/wifi/idle")
+        r2 = meta.get("calib_r2")
+        print(f"  calibration  k≈{meta.get('calib_per_core_w')} W/core · "
+              f"n={meta.get('calib_n')}"
+              + (f" · R²={r2}" if r2 is not None else ""))
+    else:
+        pline("├ apps (manageable)", meta.get("manageable_watts_est"), meta.get("manageable_core_pct"))
+        pline("└ baseline + system", None, meta.get("unmanageable_core_pct"), "screen/GPU/wifi")
+        n = meta.get("calib_n", 0)
+        need = max(0, 6 - n)
+        print(f"  calibration  learning… {n} samples"
+              + (f" (need ~{need} more on battery)" if need else " (refining)"))
+    pline("napd itself", meta.get("napd_watts_est"), meta.get("napd_cpu_pct"))
+
+    # ---- ACTIVE HARDWARE ----------------------------------------------
+    per = meta.get("peripherals", [])
+    if per:
+        print()
+        print("ACTIVE HARDWARE")
+        for p in per:
+            mark = "  ⚠" if p.get("hot") else ""
+            print(f"  {p['icon']} {p['name']:<13}{p['detail']}{mark}")
+
+    # ---- shared table row (APPS + VISIBLE share the same column grid) --
+    def row(app, cpu, w, col3, col4=""):
+        cpu_s = "" if cpu is None else f"{cpu:.1f}%"
+        print(f"  {app[:23]:<24}{cpu_s:>7}{fmt_w(w):>9}   {col3:<12}{col4}".rstrip())
+
+    # ---- APPS (managed) ------------------------------------------------
+    print()
+    print(f"  {'APPS (managed)':<24}{'CPU':>7}{'~W':>9}   {'STATE':<12}MANAGEMENT")
+    if not apps:
+        print("  (no app scopes sampled yet)")
+    else:
+        rank = {"throttled": 4, "would-throttle": 3, "watching": 2, "focused": 1, "idle": 0}
+        agg = {}
+        for a in apps:
+            g = agg.setdefault(a["app"], {"app": a["app"], "cpu": 0.0, "w": 0.0,
+                                          "focused": False, "status": "idle",
+                                          "reason": "", "capture": ""})
+            g["cpu"] += a["cpu_pct"] or 0.0
+            g["w"] += a["watts_est"] or 0.0
+            if a["state"] == "focused":
+                g["focused"] = True
+            if rank.get(a["status"], 0) > rank.get(g["status"], 0):
+                g["status"], g["reason"] = a["status"], a["reason"]
+            if a.get("capture"):
+                g["capture"] = "+".join(sorted(set(filter(None, g["capture"].split("+")))
+                                               | set(a["capture"].split("+"))))
+        rows = sorted(agg.values(), key=lambda r: r["cpu"], reverse=True)
+        shown = [r for r in rows if r["cpu"] >= 0.1 or r["focused"] or r["capture"]]
+        for r in shown:
+            row(r["app"], r["cpu"], r["w"],
+                "focused" if r["focused"] else "background", management(r))
+        idle = len(rows) - len(shown)
+        if idle:
+            print(f"  … +{idle} more idle")
+
+    # ---- VISIBLE (not managed) ----------------------------------------
+    unm = data.get("unmanaged", [])
+    if unm:
+        print()
+        print(f"  {'VISIBLE (not managed)':<24}{'CPU':>7}{'~W':>9}   WHERE")
+        for u in unm:
+            row(u["app"], u["cpu_pct"], u["watts_est"], u["source"])
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+[Unit]
+Description=napd — focus-aware power observer (observe mode)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/Projects/sys/napd/napd.py
+Restart=on-failure
+RestartSec=3
+# napd must never become the problem it watches for:
+CPUWeight=10
+Nice=10
+MemoryHigh=64M
+
+[Install]
+WantedBy=default.target
