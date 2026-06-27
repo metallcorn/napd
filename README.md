@@ -68,12 +68,15 @@ with the native systemd/upower/PPD stack. Run both.
 
 ### Debian / Ubuntu / KDE neon (`.deb`)
 
+Grab the latest `.deb` from [**Releases**](https://github.com/metallcorn/napd/releases/latest):
+
 ```sh
-sudo apt install ./napd_0.1.0_all.deb     # from a release, or build it (below)
+curl -LO https://github.com/metallcorn/napd/releases/download/v0.1.0/napd_0.1.0_all.deb
+sudo apt install ./napd_0.1.0_all.deb
 systemctl --user enable --now napd        # or just log out and back in
 ```
 
-Build the `.deb` yourself (only needs `dpkg-deb`):
+Or build it yourself (only needs `dpkg-deb`):
 
 ```sh
 ./packaging/build-deb.sh                  # → napd_0.1.0_all.deb
