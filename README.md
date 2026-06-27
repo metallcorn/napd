@@ -1,89 +1,140 @@
-# napd — focus-aware power observer (KDE Wayland)
+# napd
 
-A user-space "App Nap" for Linux. It watches which window is focused and
-attributes CPU/power to each app via cgroup v2, so you can see **who is
-burning the battery in the background** — and (optionally) cap them.
+**Focus-aware power manager for Linux — a user-space "App Nap".**
 
-Complements `power-profiles-daemon` rather than replacing it:
-PPD manages the **hardware** layer (CPU EPP, platform profile); napd manages
-the **software** layer (which app gets CPU, by focus). They share no knobs, so
-unlike TLP there is no conflict with the native systemd/upower stack.
+`napd` watches which window you're actually using and throttles the background
+CPU hogs that quietly drain your battery, releasing them the instant they regain
+focus. It also gives you a clear read-out of **who is burning the battery** and
+**how much of your power draw you can even do anything about**.
 
-## Status: OBSERVE mode (v1)
+All user-space: no root daemon, no kernel patches, no `sudo`. It rides the cgroup
+v2 controllers that systemd already delegates to your session.
 
-Throttles **nothing**. It only reports and logs what it *would* do, and flags
-apps it is unsure about (audio / allowlisted / recently focused) with a reason.
-This is the "observe → trust → enforce" path: watch it, trust it, then enable.
+```
+power: BATTERY · power-saver · ENFORCE · focus: org.kde.konsole
+────────────────────────────────────────────────────────────────────
+POWER  (~W calibrated · 16 cores)
+  total (real)             6.5 W   135%
+  SoC/GPU (amdgpu)         4.2 W
+  ├ addressable            3.3 W   135%   ← throttling can reduce
+  │   apps                 2.8 W   114%
+  │   system/kernel        0.5 W    21%
+  └ fixed baseline         3.2 W          screen/GPU/wifi/idle
+  napd itself              0.0 W     1%
 
-## Why it's cheap
+ACTIVE HARDWARE
+  📶 bluetooth    on · idle
+  📡 wi-fi        on · 17 KB/s
+  🔆 display      30%
 
-* **Event-driven**: focus arrives as a D-Bus push from a tiny KWin script; the
-  GLib loop is blocked on epoll otherwise (~0% CPU at idle).
-* A **slow sampler** (20s) reads cgroup `cpu.stat` (microseconds of work) to
-  attribute power. No fast polling — napd must never be the wakeup source.
-* **Self-accounting**: `napctl` shows napd's own cpu cost so you can verify it
-  saves far more than it spends (measured ~0.05% core).
-
-## Install / use
-
-```sh
-./install.sh                 # systemd --user service, no root
-./napctl                     # status table (the future Plasma-applet backend)
-journalctl --user -u napd -f # live log of focus + "would throttle" decisions
-./uninstall.sh               # clean removal, releases any caps
+  APPS (managed)              CPU       ~W   STATE       MANAGEMENT
+  org.kde.konsole           83.3%    2.0 W   focused     FOCUS
+  com.google.Chrome         20.1%    0.5 W   background  CAPPED
+  firefox                   10.3%    0.2 W   background  PROTECTED · focus-grace
 ```
 
-## Enabling enforcement (later)
+## Why it's not TLP / powertop
 
-Edit `CONFIG["mode"]` in `napd.py` from `"observe"` to `"enforce"` and restart
-(`systemctl --user restart napd`). In enforce mode, background apps above
-`bg_cpu_flag_pct` that are **not** protected get `cpu.max` capped to
-`throttle_pct` (default 10%) of one core, released the instant they regain
-focus. Protected = camera/mic in use (whole app), on the allowlist, playing
-audio, or within the focus grace window.
+`napd` manages the **software** layer (which app gets CPU, by focus). Tools like
+`power-profiles-daemon` (PPD) manage the **hardware** layer (CPU EPP, platform
+profile). They share no knobs, so — unlike TLP — `napd` does **not** conflict
+with the native systemd/upower/PPD stack. Run both.
+
+## Features
+
+- 🎯 **Focus-aware throttling** — background CPU hogs are capped (cgroup `cpu.max`,
+  default 10% of one core) and released **instantly** when you focus them.
+- 🔋 **Battery-only** — on AC charger nothing is throttled (full speed). Configurable.
+- 🛡️ **Never throttles** an app using the **camera/mic** (video calls), playing
+  **audio**, the desktop shell (allowlist), or one you focused in the last 30s.
+- 📊 **Power read-out** — real total draw (battery), SoC/GPU package (amdgpu), and
+  a calibrated split into *addressable* (what throttling can reduce) vs *fixed
+  baseline* (screen/GPU/wifi — untouchable).
+- ⚡ **Active-hardware panel** — camera, mic, audio, Bluetooth (+device), Wi-Fi
+  throughput, display, keyboard backlight — shows only what's on.
+- 🪶 **Cheap** — event-driven (focus is a D-Bus push), ~1–2% of one core idle.
+- 🔌 **D-Bus contract** — every UI (the `napctl` CLI, a future Plasma applet, a
+  GNOME extension) is a thin client of one `Status()` call. See
+  [`INTERFACE.md`](INTERFACE.md).
+
+## Requirements
+
+- KDE Plasma 6 on **Wayland** (focus comes from a KWin script)
+- cgroup v2 with the `cpu` controller delegated to the user session (systemd default)
+- `python3`, `python3-dbus`, `python3-gi` (present on most KDE/GNOME systems)
+- AMD GPU for the `amdgpu` watt read-out (optional; everything else works without it)
+
+## Install
+
+```sh
+git clone https://github.com/metallcorn/napd
+cd napd
+./install.sh          # installs a systemd --user service, no root
+```
+
+```sh
+./napctl                      # status read-out
+journalctl --user -u napd -f  # live decisions log
+./uninstall.sh                # clean removal (releases all caps first)
+```
+
+## Configuration
+
+Edit the `CONFIG` block at the top of `napd.py`, then
+`systemctl --user restart napd`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `mode` | `enforce` | `enforce` (throttle) or `observe` (only report) |
+| `throttle_pct` | `10` | background cap, % of one core |
+| `enforce_on_ac` | `False` | also throttle on AC charger |
+| `bg_cpu_flag_pct` | `2.0` | a background app above this is a candidate |
+| `focus_grace_sec` | `30` | don't touch an app for N s after it loses focus |
+| `sample_interval_sec` | `10` | how fast caps apply / decisions refresh |
+| `protect_apps` | konsole, kwin, … | substrings of app-ids that are never throttled |
 
 ## How it works
 
 | Concern | Mechanism |
 |---|---|
 | Focus → app | KWin script `napd-focus.js` → `FocusChanged` over D-Bus |
-| App → cgroup | `/proc/PID/cgroup` → `app-*.scope` under the user `app.slice` |
-| Power per app | `cpu.stat usage_usec` deltas → % of one core → rough watts |
-| Audio protection | `pactl list sink-inputs` (non-corked) → protected PIDs |
-| Capture protection | camera (`fuser /dev/video*`) + mic (`pactl source-outputs`); protects the **whole app**, so a backgrounded video call is never throttled |
-| ⚡ ACTIVE panel | energy-relevant hardware/states: camera 🎥, mic 🎤, audio 🔊, Bluetooth 📶 (+connected device), Wi-Fi 📡, display 🔆, kbd backlight ⌨ — shows only what's on; `⚠ notable` flags the heavy ones |
-| Stream→app mapping | `pactl` forced to `LC_ALL=C`; mapped via flatpak `portal.app_id` → host pid → binary (robust to sandbox PID namespaces) |
-| Throttle | write `cpu.max` to the app scope (delegated, no root) |
+| App → cgroup | `/proc/PID/cgroup` → `app-*.scope`/`app-*.service` under the user `app.slice` |
+| Throttle / release | write `cpu.max` to the app's scope (delegated, no root) |
+| Per-app CPU | `cpu.stat usage_usec` deltas → % of one core |
+| Mic / audio | `pactl` (forced `LC_ALL=C`), mapped via flatpak `portal.app_id` → pid → binary |
+| Camera | in-process `/proc/*/fd` scan for `/dev/video*` holders |
+| Watts | real total from `BAT0`; per-app via a calibrated `watts ≈ base + k·cpu%` model |
 
 ## Power model — "what are we actually fighting for"
 
-Per-process wattage isn't exposed by any kernel interface, so napd derives it:
+No kernel interface exposes per-process wattage, so `napd` derives it. On battery
+it fits `watts ≈ base + k·cpu_core%` over a rolling window
+(`~/.local/state/napd/calib.json`) and splits the **real** total draw into:
 
-* **Total draw** — real, from `BAT0` (`power_now`, or `current×voltage` when the
-  gauge reports 0). Only meaningful on battery; `n/a` on AC.
-* **SoC/GPU package** — real, from the `amdgpu` hwmon (`power1_average`).
-  Readable even on AC; a direct "active silicon" number.
-* **Calibration** — on battery, napd fits `watts ≈ base + k·cpu_core%` over a
-  rolling window (`~/.local/state/napd/calib.json`). This splits the total into:
-  * **addressable (CPU-dynamic)** = `k·cpu%` — what throttling can reclaim,
-    broken into *our apps* vs *system/kernel*;
-  * **fixed baseline** = the rest (screen/GPU/wifi/idle SoC) — untouchable.
+- **addressable (CPU-dynamic)** `= k·cpu%` — what throttling can reclaim (further
+  split into *our apps* vs *system/kernel*);
+- **fixed baseline** — the rest (screen, GPU, wifi, idle SoC) which no amount of
+  app throttling can touch.
 
-  So the table answers directly: of N watts, you can fight for ~X. Needs a few
-  minutes on battery with varying load to lock in `k` and `base`.
+This is the honest answer to "is this even worth it": on a typical laptop the
+fixed baseline dominates, and app-level power management buys the CPU-dynamic
+slice — most valuable for heat/fan noise and runaway background apps.
 
-## Coverage — what we see vs manage
+## Coverage
 
-* **managed** (see + throttle): user `app.slice` units — both `app-*.scope`
-  (KDE/flatpak) and `app-*.service` (e.g. Firefox).
-* **visible, not managed** (read-only): `session.slice` (kwin/plasmashell) and
-  root `system.slice` daemons — `cpu.stat` is world-readable, so we surface them
-  (this is how we caught ESET antivirus eating ~20–40% CPU) but never throttle.
-* **unattributable**: kernel threads, GPU/display/wifi power — stays in baseline.
+- **managed** (see + throttle): user `app.slice` units.
+- **visible, not managed** (read-only): `session.slice` (compositor/shell) and root
+  `system.slice` daemons — `cpu.stat` is world-readable, so they're surfaced but
+  never throttled.
+- **unattributable**: kernel threads, and non-CPU power (display/GPU/wifi/radio) —
+  these have no per-device meter and live in the fixed baseline.
 
-## Known refinements (not yet done)
+## Status
 
-* RAPL CPU-package energy (`intel-rapl/energy_uj`) would give exact CPU watts but
-  is root-gated here — would need a small system helper.
-* Audio detection uses `pactl` per sample tick; a PipeWire event subscription
-  would be fully event-driven for enforce mode.
+Works on the author's AMD ThinkPad (Plasma 6 / Wayland). It's a focused personal
+tool, not (yet) a packaged distro service — see the issues/roadmap for `.deb`
+packaging and a Plasma applet.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
