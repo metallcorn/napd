@@ -1,0 +1,9 @@
+#!/bin/sh
+# Enable the user service for all users (starts at their next login; a logged-in
+# user can `systemctl --user start napd` now). User units can't be started from
+# this root, session-less context — only enabled globally.
+set -e
+if [ "$1" = "configure" ]; then
+    systemctl --global enable napd.service >/dev/null 2>&1 || true
+fi
+exit 0

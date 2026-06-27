@@ -1,0 +1,14 @@
+Package: napd
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3, python3-dbus, python3-gi
+Recommends: power-profiles-daemon
+Maintainer: metallcorn <metallcorn@users.noreply.github.com>
+Homepage: https://github.com/metallcorn/napd
+Description: Focus-aware power manager for Linux (user-space App Nap)
+ napd watches the focused window on KDE Plasma (Wayland) and throttles
+ background CPU hogs via cgroup v2, releasing them instantly on focus.
+ It protects apps using the camera, microphone or audio, only throttles
+ on battery, and reports per-app power. All user-space, no root daemon.

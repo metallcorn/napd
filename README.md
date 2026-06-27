@@ -66,16 +66,35 @@ with the native systemd/upower/PPD stack. Run both.
 
 ## Install
 
+### Debian / Ubuntu / KDE neon (`.deb`)
+
+```sh
+sudo apt install ./napd_0.1.0_all.deb     # from a release, or build it (below)
+systemctl --user enable --now napd        # or just log out and back in
+```
+
+Build the `.deb` yourself (only needs `dpkg-deb`):
+
+```sh
+./packaging/build-deb.sh                  # → napd_0.1.0_all.deb
+```
+
+### From source (any distro)
+
 ```sh
 git clone https://github.com/metallcorn/napd
 cd napd
-./install.sh          # installs a systemd --user service, no root
+./install.sh          # systemd --user service, no root
 ```
 
+> Use **one** method. The source `install.sh` puts a unit in `~/.config`, which
+> shadows the packaged one — run `./uninstall.sh` before switching to the `.deb`.
+
+### Use
+
 ```sh
-./napctl                      # status read-out
+napctl                        # status read-out  (./napctl from a source checkout)
 journalctl --user -u napd -f  # live decisions log
-./uninstall.sh                # clean removal (releases all caps first)
 ```
 
 ## Configuration
