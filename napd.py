@@ -452,10 +452,15 @@ class NapDaemon(dbus.service.Object):
         self.focused_scope = scope
         self.focused_app = self.cg.appid_from_scope(os.path.basename(scope)) if scope else None
         self.last_focus_change = time.monotonic()
-        # focused app must never stay capped — release immediately
-        if CONFIG["mode"] == "enforce" and scope in self.capped:
-            self.cg.clear_cap(scope)
-            self.capped.discard(scope)
+        # focused app must never stay capped — release ALL its cgroups now.
+        # A flatpak browser spans several scopes (window+GPU in one, the
+        # sandboxed renderer-zygote in another); freeing only the window's
+        # scope leaves the renderers throttled and the page won't paint.
+        if CONFIG["mode"] == "enforce" and self.focused_app:
+            for sc in list(self.capped):
+                if self.cg.appid_from_scope(os.path.basename(sc)) == self.focused_app:
+                    self.cg.clear_cap(sc)
+                    self.capped.discard(sc)
         log(f"focus -> {self.focused_app or '?'} ({cls})")
 
     # ---- D-Bus: status for napctl / future Plasma applet ---------------
@@ -526,7 +531,8 @@ class NapDaemon(dbus.service.Object):
                 dt = (now - prev[1]) * 1_000_000  # to usec
                 pct = round(100.0 * (usage - prev[0]) / dt, 1) if dt > 0 else 0.0
 
-            focused = scope == self.focused_scope
+            # focused = any scope of the focused APP (browsers span several)
+            focused = (self.focused_app is not None and appid == self.focused_app)
             # app-level capture: show the whole app's cam/mic on every scope
             cap_tag = capture_apps.get(appid, "") or capmap.get(scope, "")
             protected_by = None
