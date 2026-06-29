@@ -160,6 +160,7 @@ def read_amdgpu_watts():
 STATE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "napd")
 CALIB_FILE = os.path.join(STATE_DIR, "calib.json")
+STATS_FILE = os.path.join(STATE_DIR, "stats.json")
 
 
 class Calibrator:
@@ -175,6 +176,7 @@ class Calibrator:
         self.path = path
         self.pts = collections.deque(maxlen=maxlen)  # (cpu_core_pct, watts)
         self.k = self.base = self.r2 = None
+        self._last_save = 0.0
         self._load()
         self._fit()
 
@@ -183,7 +185,11 @@ class Calibrator:
             return
         self.pts.append((round(cpu_pct, 2), round(watts, 3)))
         self._fit()
-        self._save()
+        # persist at most every 5 min — not every tick (avoid needless disk I/O)
+        now = time.monotonic()
+        if now - self._last_save >= 300:
+            self._save()
+            self._last_save = now
 
     def _fit(self):
         n = len(self.pts)
@@ -398,6 +404,109 @@ def bt_connected_devices():
         return []
 
 
+def _today():
+    return time.strftime("%Y-%m-%d")
+
+
+class UsageStats:
+    """Per-app baselines (a decaying histogram → percentiles) for spotting
+    anomalies ('using more than usual'), plus per-app energy accumulated today.
+    Lightweight: rides the existing tick, kept in RAM, flushed to disk rarely."""
+    NB = 48          # histogram buckets
+    BW = 8.0         # bucket width in %-of-one-core (covers 0..384%)
+    DECAY = 0.998    # per-tick decay → baseline adapts over ~hours
+    FLOOR = 18.0     # never flag apps quieter than this
+    FLUSH_SEC = 300  # persist at most every 5 min
+
+    def __init__(self, path=STATS_FILE):
+        self.path = path
+        self.day = _today()
+        self.hist = {}        # appid -> [NB] decaying counts
+        self.wh = {}          # appid -> Wh accumulated today
+        self._last_save = 0.0
+        self._load()
+
+    def add(self, appid, pct, dt, wpc):
+        if pct is None:
+            return
+        h = self.hist.get(appid)
+        if h is None:
+            h = [0.0] * self.NB
+            self.hist[appid] = h
+        for i in range(self.NB):
+            h[i] *= self.DECAY
+        h[min(self.NB - 1, max(0, int(pct / self.BW)))] += 1.0
+        self.wh[appid] = self.wh.get(appid, 0.0) + (pct / 100.0 * wpc) * (dt / 3600.0)
+
+    def _pct(self, appid, q):
+        h = self.hist.get(appid)
+        if not h:
+            return None
+        tot = sum(h)
+        if tot < 5:
+            return None
+        target, c = tot * q, 0.0
+        for i in range(self.NB):
+            c += h[i]
+            if c >= target:
+                return round((i + 0.5) * self.BW, 1)
+        return self.NB * self.BW
+
+    def usual(self, appid):
+        return self._pct(appid, 0.5)
+
+    def is_anom(self, appid, pct):
+        if pct is None or pct < self.FLOOR:
+            return False
+        p95 = self._pct(appid, 0.95)
+        return p95 is not None and pct > p95 + self.BW
+
+    def roll_day(self):
+        d = _today()
+        if d != self.day:
+            self.day, self.wh = d, {}
+
+    def daily_top(self, n=15):
+        items = sorted(self.wh.items(), key=lambda kv: kv[1], reverse=True)
+        return [{"app": a, "wh": round(w, 3)} for a, w in items[:n] if w > 0.0005]
+
+    def _prune(self):
+        # drop apps whose baseline has decayed away (idle for hours), and
+        # hard-cap the table so the file can never grow unbounded
+        for a in [a for a, h in self.hist.items() if sum(h) < 0.3]:
+            if self.wh.get(a, 0.0) < 0.0005:
+                del self.hist[a]
+        if len(self.hist) > 120:
+            keep = sorted(self.hist, key=lambda a: sum(self.hist[a]), reverse=True)[:120]
+            self.hist = {a: self.hist[a] for a in keep}
+
+    def maybe_flush(self, now):
+        if now - self._last_save >= self.FLUSH_SEC:
+            self._prune()
+            self._save()
+            self._last_save = now
+
+    def _load(self):
+        try:
+            with open(self.path) as f:
+                d = json.load(f)
+            self.hist = {k: list(v) for k, v in d.get("hist", {}).items()}
+            if d.get("day") == self.day:
+                self.wh = {k: float(v) for k, v in d.get("wh", {}).items()}
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "w") as f:
+                json.dump({"day": self.day, "wh": self.wh,
+                           "hist": {k: [round(x, 2) for x in v]
+                                    for k, v in self.hist.items()}}, f)
+        except OSError:
+            pass
+
+
 class NapDaemon(dbus.service.Object):
     def __init__(self, bus):
         super().__init__(bus, OBJ_PATH)
@@ -415,6 +524,9 @@ class NapDaemon(dbus.service.Object):
         self.ncpu = os.cpu_count() or 1
         self._cache = {}               # ttl cache for subprocess reads
         self.calib = Calibrator()      # learns watts = base + k·cpu% on battery
+        self.stats = UsageStats()      # per-app baselines + daily energy
+        self.anom = set()              # app-ids currently flagged anomalous
+        self.anom_streak = {}          # app-id -> consecutive over-baseline ticks
         self._net_prev = None          # (rx+tx bytes, ts) for wifi throughput
         self.capped = set()            # scopes we currently throttle (enforce)
         GLib.timeout_add_seconds(CONFIG["sample_interval_sec"], self._tick)
@@ -483,6 +595,12 @@ class NapDaemon(dbus.service.Object):
         meta["napd_cpu_pct"] = self.sysinfo.get("napd_cpu_pct", meta["napd_cpu_pct"])
         meta["napd_watts_est"] = self.sysinfo.get("napd_watts_est", meta["napd_watts_est"])
         return json.dumps({"meta": meta, "apps": apps, "unmanaged": unmanaged})
+
+    @dbus.service.method(IFACE, in_signature="", out_signature="s")
+    def DailyUsage(self):
+        # per-app energy accumulated since midnight — for the applet's
+        # "today" breakdown. Polled rarely (on popup open), not every 2s.
+        return json.dumps({"day": self.stats.day, "apps": self.stats.daily_top()})
 
     # ---- core sampler: measure once, relative to `store`'s prev sample --
     def _collect(self, store):
@@ -574,6 +692,8 @@ class NapDaemon(dbus.service.Object):
                 "status": status,
                 "reason": reason,
                 "capture": cap_tag,
+                "anom": appid in self.anom,
+                "usual": self.stats.usual(appid),
             }
 
         # ---- system-wide breakdown: total / manageable / unmanageable -----
@@ -788,6 +908,22 @@ class NapDaemon(dbus.service.Object):
         if sysinfo.get("source") == "battery":
             self.calib.add(sysinfo.get("sys_core_pct"), sysinfo.get("total_watts"))
 
+        # ---- per-app stats: baselines (anomalies) + daily energy ----
+        self.stats.roll_day()
+        wpc = (self.calib.k * 100) if self.calib.k is not None else CONFIG["watts_per_core"]
+        per_app = {}
+        for r in report.values():
+            if r["cpu_pct"] is not None:
+                per_app[r["app"]] = per_app.get(r["app"], 0.0) + r["cpu_pct"]
+        for appid, cpu in per_app.items():
+            self.stats.add(appid, cpu, CONFIG["sample_interval_sec"], wpc)
+            if self.stats.is_anom(appid, cpu):
+                self.anom_streak[appid] = self.anom_streak.get(appid, 0) + 1
+            else:
+                self.anom_streak[appid] = 0
+        self.anom = {a for a, s in self.anom_streak.items() if s >= 3}  # ~30s sustained
+        self.stats.maybe_flush(time.monotonic())
+
         enforcing = (CONFIG["mode"] == "enforce"
                      and (sysinfo.get("source") == "battery" or CONFIG["enforce_on_ac"]))
         if enforcing:
@@ -845,6 +981,7 @@ class NapDaemon(dbus.service.Object):
         for scope in list(self.capped):
             self.cg.clear_cap(scope)
         self.calib._save()
+        self.stats._save()
         self.unload_kwin_script()
 
 

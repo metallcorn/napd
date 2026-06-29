@@ -23,6 +23,16 @@ own cadence gives you that cadence's resolution.
 `cpu.stat` reads plus probes (audio/camera/etc.) that are internally cached for
 several seconds. There is no change signal yet (planned); poll for now.
 
+### `DailyUsage() → s`
+
+Returns a JSON string with per-app energy accumulated since local midnight —
+for a "today's battery use" view. Poll rarely (e.g. only while the popup is open).
+
+```jsonc
+{ "day": "2026-06-29",
+  "apps": [ { "app": "com.google.Chrome", "wh": 4.21 } ] }   // sorted desc, top ~15
+```
+
 ### `FocusChanged(s pid, s class, s caption)` — internal
 
 Called by the bundled KWin script to push focus changes. **Not for UIs.**
@@ -84,7 +94,9 @@ Called by the bundled KWin script to push focus changes. **Not for UIs.**
       "watts_est":2.0,               // null if cpu_pct is null
       "status":   "focused",         // see status values below
       "reason":   "",                // human note, e.g. the protection reason
-      "capture":  ""                 // "" | "cam" | "mic" | "cam+mic"
+      "capture":  "",                // "" | "cam" | "mic" | "cam+mic"
+      "anom":     false,             // true = sustained CPU above this app's own usual
+      "usual":    25.0               // median CPU% baseline (%core), or null until learned
     }
   ],
 
