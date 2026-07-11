@@ -510,6 +510,7 @@ class UsageStats:
 class NapDaemon(dbus.service.Object):
     def __init__(self, bus):
         super().__init__(bus, OBJ_PATH)
+        self.bus = bus
         self.cg = CgroupView()
         self.focused_scope = None
         self.focused_app = None
@@ -951,22 +952,62 @@ class NapDaemon(dbus.service.Object):
         return True  # keep the GLib timer alive
 
     # ---- KWin script lifecycle -----------------------------------------
-    def load_kwin_script(self, attempt=1):
+    def _kwin_script_loaded(self):
+        """Ask KWin whether our focus script is actually registered. Returns
+        True/False, or None if KWin couldn't be reached."""
         try:
-            subprocess.run(["qdbus6", "org.kde.KWin", "/Scripting",
-                            "org.kde.kwin.Scripting.loadScript",
-                            KWIN_SCRIPT, KWIN_SCRIPT_NAME],
-                           capture_output=True, timeout=5)
-            subprocess.run(["qdbus6", "org.kde.KWin", "/Scripting",
-                            "org.kde.kwin.Scripting.start"],
-                           capture_output=True, timeout=5)
-            log("KWin focus script loaded")
+            r = subprocess.run(
+                ["qdbus6", "org.kde.KWin", "/Scripting",
+                 "org.kde.kwin.Scripting.isScriptLoaded", KWIN_SCRIPT_NAME],
+                capture_output=True, timeout=5, text=True)
+            if r.returncode != 0:
+                return None
+            return r.stdout.strip() == "true"
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def load_kwin_script(self, attempt=1):
+        # Idempotent + verified: KWin's loadScript exits 0 even when it silently
+        # rejects the load (e.g. called during login before the scripting service
+        # is ready), so we must confirm with isScriptLoaded and retry until it
+        # really takes. Without focus events every background app stays capped
+        # forever — including the browser, which then won't paint.
+        try:
+            if self._kwin_script_loaded() is not True:
+                subprocess.run(["qdbus6", "org.kde.KWin", "/Scripting",
+                                "org.kde.kwin.Scripting.loadScript",
+                                KWIN_SCRIPT, KWIN_SCRIPT_NAME],
+                               capture_output=True, timeout=5)
+                subprocess.run(["qdbus6", "org.kde.KWin", "/Scripting",
+                                "org.kde.kwin.Scripting.start"],
+                               capture_output=True, timeout=5)
         except (OSError, subprocess.SubprocessError) as e:
-            if attempt < 10:
-                GLib.timeout_add_seconds(3, lambda: self.load_kwin_script(attempt + 1) and False)
-            else:
-                log(f"could not load KWin script: {e}")
+            log(f"KWin loadScript call failed: {e}")
+
+        if self._kwin_script_loaded() is True:
+            log("KWin focus script loaded")
+        elif attempt < 20:
+            GLib.timeout_add_seconds(3, lambda: self.load_kwin_script(attempt + 1) and False)
+        else:
+            log("could not load KWin focus script after 20 tries — "
+                "focus events unavailable, throttling stays paused")
         return False
+
+    def _watch_kwin_restarts(self):
+        """Re-install the focus script whenever KWin (re)appears on the bus.
+        A KWin restart (update/crash/compositor reset) drops all loaded scripts
+        silently; this event-driven hook re-registers ours at ~zero cost."""
+        def owner_changed(name, old_owner, new_owner):
+            if name == "org.kde.KWin" and new_owner:
+                self.focused_scope = None
+                self.focused_app = None
+                log("KWin (re)appeared — reloading focus script")
+                self.load_kwin_script()
+        self.bus.add_signal_receiver(
+            owner_changed,
+            signal_name="NameOwnerChanged",
+            dbus_interface="org.freedesktop.DBus",
+            arg0="org.kde.KWin")
 
     def unload_kwin_script(self):
         try:
@@ -991,6 +1032,7 @@ def main():
     name = dbus.service.BusName(BUS_NAME, bus, do_not_queue=True)  # noqa: F841
     daemon = NapDaemon(bus)
     daemon.load_kwin_script()
+    daemon._watch_kwin_restarts()
 
     loop = GLib.MainLoop()
 

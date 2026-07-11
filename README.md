@@ -71,15 +71,15 @@ with the native systemd/upower/PPD stack. Run both.
 Grab the latest `.deb` from [**Releases**](https://github.com/metallcorn/napd/releases/latest):
 
 ```sh
-curl -LO https://github.com/metallcorn/napd/releases/download/v0.1.0/napd_0.1.0_all.deb
-sudo apt install ./napd_0.1.0_all.deb
+curl -LO https://github.com/metallcorn/napd/releases/download/v0.2.0/napd_0.2.0_all.deb
+sudo apt install ./napd_0.2.0_all.deb
 systemctl --user enable --now napd        # or just log out and back in
 ```
 
 Or build it yourself (only needs `dpkg-deb`):
 
 ```sh
-./packaging/build-deb.sh                  # → napd_0.1.0_all.deb
+./packaging/build-deb.sh                  # → napd_0.2.0_all.deb
 ```
 
 ### From source (any distro)

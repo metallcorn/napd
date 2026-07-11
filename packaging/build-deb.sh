@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${1:-0.1.0}"
+VERSION="${1:-0.2.0}"
 PKG="$(mktemp -d)/napd"
 trap 'rm -rf "$(dirname "$PKG")"' EXIT
 
